@@ -1,0 +1,155 @@
+
+pipeline {
+    agent any
+
+    environment {
+        AWS_DEFAULT_REGION = 'ap-south-1'
+        EKS_CLUSTER        = 'eks'
+        DOCKER_IMAGE       = 'royalpatel95/container'
+        K8S_NAMESPACE      = 'prod'
+        K8S_DEPLOYMENT     = 'portfolio'
+        K8S_CONTAINER      = 'portfolio'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    url: 'https://github.com/RoyalPatel95/portfolio.git'
+            }
+        }
+
+        stage('Docker Login') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'jenkins',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "$DOCKER_PASS" | docker login \
+                            -u "$DOCKER_USER" \
+                            --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Building Docker image..."
+
+                    docker build \
+                        -t ${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                        -t ${DOCKER_IMAGE}:latest .
+                '''
+            }
+        }
+
+        stage('Docker Push') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "Pushing versioned image..."
+
+                    docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
+
+                    echo "Pushing latest image..."
+
+                    docker push ${DOCKER_IMAGE}:latest
+                '''
+            }
+        }
+
+        stage('Deploy to EKS') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'aws',
+                        usernameVariable: 'AWS_ACCESS_KEY_ID',
+                        passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Checking AWS identity..."
+
+                        aws sts get-caller-identity
+
+                        echo "Updating EKS kubeconfig..."
+
+                        aws eks update-kubeconfig \
+                            --region ${AWS_DEFAULT_REGION} \
+                            --name ${EKS_CLUSTER}
+
+                        echo "Applying Kubernetes namespace..."
+
+                        kubectl apply -f k8s/namespace.yml
+
+                        echo "Applying Kubernetes deployment..."
+
+                        kubectl apply -f k8s/deployment.yml
+
+                        echo "Applying Kubernetes service..."
+
+                        kubectl apply -f k8s/service.yml
+
+                        echo "Updating application image..."
+
+                        kubectl set image \
+                            deployment/${K8S_DEPLOYMENT} \
+                            ${K8S_CONTAINER}=${DOCKER_IMAGE}:${BUILD_NUMBER} \
+                            -n ${K8S_NAMESPACE}
+
+                        echo "Waiting for rollout..."
+
+                        kubectl rollout status \
+                            deployment/${K8S_DEPLOYMENT} \
+                            -n ${K8S_NAMESPACE} \
+                            --timeout=300s
+
+                        echo "Checking deployment..."
+
+                        kubectl get deployment \
+                            ${K8S_DEPLOYMENT} \
+                            -n ${K8S_NAMESPACE}
+
+                        echo "Checking pods..."
+
+                        kubectl get pods -n ${K8S_NAMESPACE}
+
+                        echo "Checking service..."
+
+                        kubectl get svc -n ${K8S_NAMESPACE}
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh '''
+                docker logout || true
+            '''
+        }
+
+        success {
+            echo 'CI/CD Pipeline completed successfully!'
+        }
+
+        failure {
+            echo 'CI/CD Pipeline failed. Check Jenkins Console Output.'
+        }
+    }
+}
